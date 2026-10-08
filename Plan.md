@@ -1,7 +1,17 @@
 # Plan.md — Milestones and Validations
 
 **Companion to:** `PROMPT.md` (the specification). Where the two conflict, `PROMPT.md` wins.
-**Status:** Draft v1 · blocked on `PROMPT.md` §19.1–19.4
+**Status:** Draft v2 · reordered by amendment 2026-10-08 (`docs/decisions.md`)
+
+> ## ⏳ TIME-CRITICAL
+>
+> **Model access lasts 2–3 days from 2026-10-08.** GraphRAG indexing consumes model tokens; everything else does not. **Index first** (`M6a–M6c`), then the safety core (`M4–M5`).
+>
+> **If you are reading this after the window closes:** check whether `data/qdrant/` and `data/neo4j/` were populated, and whether the content-hash extraction cache exists. Units extracted during the window are **cached and never re-billed** — that value survives. Units never extracted must be paid for later at full price against some other provider, or not at all if none is configured.
+>
+> Best achievable end state: extraction complete (most valuable, ~75% of index cost), reports missing — the graph persists in Neo4j and reports regenerate on any provider.
+>
+> Read `docs/decisions.md` before changing this ordering.
 
 ---
 
@@ -17,7 +27,17 @@ Work through milestones in order. One milestone = one focused loop:
 ```
 
 **Never** start milestone *n+1* while *n* is failing.
-**Never** begin any milestone until the four open decisions in `PROMPT.md` §19.1–19.4 are answered.
+
+**Gating decisions** (`PROMPT.md` §19) — check status, they move:
+
+| § | Decision | Status | Blocks |
+|---|---|---|---|
+| 19.1 | Laya API contract | **open** | M2, M3 |
+| 19.2 | Phase B label source | **open** | M13+ |
+| 19.3 | LLM backend | **answered 2026-10-08** — the stealth models; needs `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL_ID` env values | M6, M7 |
+| 19.4 | RAG corpus | **choosing now** | M6 |
+
+A milestone whose gate is open must not start. Do not substitute a mock and continue.
 
 ---
 
@@ -25,14 +45,21 @@ Work through milestones in order. One milestone = one focused loop:
 
 | Stage | Milestones | Outcome |
 |---|---|---|
-| **A — Foundation** | M0–M3 | Scaffolding, contracts, decision layer talking to Laya |
-| **B — Safety core** | M4–M5 | Rule engine and deterministic lookup tools |
-| **C — Knowledge & generation** | M6–M7 | RAG and the LLM, behind policy |
-| **D — Assembly** | M8–M11 | Orchestrator, permissions, service, evaluation |
-| **E — Report** | M12 | **Phase A complete — baseline published** |
-| **F — Improve** | M13–M15 | **Phase B complete — fine-tuned and compared** |
+| **0 — Foundation** | M0–M1 | Scaffolding, contracts, question schemas |
+| **1 — Index now** ⏳ | **M6a–M6c** | **GraphRAG pipeline built and corpus indexed while models last** |
+| **2 — Safety core** | M4–M5 | Rule engine and deterministic lookup tools |
+| **3 — Retrieval + generation** | M6d, M7 | Search modes, Laya routing, LLM behind policy |
+| **4 — Assembly** | M8–M11 | Orchestrator, permissions, service, evaluation |
+| **5 — Report** | M12 | **Phase A complete — baseline published** |
+| **6 — Improve** | M13–M15 | **Phase B complete — fine-tuned and compared** |
 
-Phase A ends at **M12**. Nothing in Stage F may begin before the baseline report exists.
+Stages 1 and 2 are **swapped from draft v1** — see `docs/decisions.md` (2026-10-08). The original order was sound; an assumption behind it was wrong.
+
+**Inside stage 1, prioritise:** extraction → description summarisation → community reports. Extraction is ~75% of index cost and everything else derives from it. If the window closes early, stop after extraction — that is the recoverable end state.
+
+**M2–M3 (Laya fixtures, decision client) are not in a stage** — they are unblocked by `PROMPT.md` §19.1 alone and may run in parallel with stage 1 whenever the API contract is available.
+
+Phase A ends at **M12**. Nothing in stage 6 may begin before the baseline report exists.
 
 ---
 
@@ -173,24 +200,49 @@ make arch
 
 ---
 
-### M6 — RAG (`kb_search`)
+### M6 — GraphRAG retrieval (`kb_search`)
+
+**Full design:** `docs/rag_implementationplan.md`. Read it before starting this milestone.
 
 **Build**
-- `src/harness/tools/kb.py` — chunking, embedding, cosine search, citation resolution
+- `compose.yaml` — Qdrant + Neo4j, dev-only, volumes under `data/`
+- `src/harness/tools/embeddings.py` — `all-MiniLM-L6-v2` client + stub
+- `src/harness/tools/qdrant_store.py` — 3 collections: `entities`, `text_units`, `community_reports`
+- `src/harness/tools/neo4j_store.py` — graph model + provenance edges
+- `src/harness/tools/communities.py` — hierarchical Leiden
+- `src/harness/tools/kb.py` — three search modes + Laya mode router
+- `scripts/rag_index.py` — offline indexing pipeline (`make rag-index`)
 - `data/corpus/` — curated source documents
-- `data/index/` — precomputed embeddings (`embeddings.npy` + metadata)
-- A deterministic `hash` embedder for tests, so tests never download a model
+
+**Milestone split** — do all four before M7 depends on retrieval:
+- **M6a** — embeddings + Qdrant + chunking
+- **M6b** — Neo4j graph model, entity/relationship extraction, Leiden communities
+- **M6c** — community reports + report embeddings
+- **M6d** — Local, Global, Basic search + Laya routing
 
 **Acceptance**
-- [ ] Every search result resolves to an id present in the corpus
+- [ ] Every search result resolves to a text unit present in the corpus
+- [ ] **No citation resolves to a generated entity or relationship description** (`Plan.md` D20)
 - [ ] An unresolvable citation is a **hard failure**, never a warning
 - [ ] Retrieved text is placed in the data channel, structurally separated from instructions
-- [ ] Search results are reproducible: same query + same index → same ids in the same order
+- [ ] Same query + same index → same ids in the same order, across all three modes
+- [ ] Identical queries route to the same mode every time
+- [ ] Re-running the indexer is idempotent — no duplicate nodes, and unchanged units are not re-billed to the LLM
+- [ ] Community ids are stable across two identical index runs
 - [ ] Corpus has ≥ 10 documents with recorded provenance
+- [ ] `make rag-cost` reports tokens and cost per indexing stage
+- [ ] Both stores down → `degraded: true`, decision and escalation still returned
+- [ ] Indexing never runs inside a test or a request path (`Plan.md` D19)
 
 **Validation**
 ```bash
-pytest tests/unit/test_kb.py tests/security/test_injection_channel.py -q
+make up
+make rag-index-smoke            # 3 documents, offline assert, no LLM
+pytest tests/unit/test_kb.py -q
+pytest tests/security/test_injection_channel.py tests/security/test_citation_provenance.py -q
+make rag-query-smoke            # all three modes return resolvable citations
+make rag-cost
+make rag-down-probe            # both stores down, safety path intact
 make arch
 ```
 
@@ -400,6 +452,9 @@ Every gate is a `make` target. `make validate` runs them in order and stops at t
 | Command | Runs | Gates |
 |---|---|---|
 | `make install` | dependency install from pinned versions | — |
+| `make up` / `make down` | start / stop Qdrant + Neo4j (dev only) | — |
+| `make rag-index` | run the offline GraphRAG indexing pipeline | — |
+| `make rag-cost` | tokens and cost per indexing stage | — |
 | `make lint` | `ruff check` | style |
 | `make type` | `mypy src` | types |
 | `make arch` | `python scripts/check_architecture.py` | §4 dependency contracts |
@@ -440,7 +495,11 @@ medical-harness/
 │   │   ├── base.py             #   { facts, source_ids, source_type }
 │   │   ├── labs.py
 │   │   ├── drugs.py
-│   │   ├── kb.py               #   RAG
+│   │   ├── kb.py               #   GraphRAG: local / global / basic
+│   │   ├── embeddings.py       #   all-MiniLM-L6-v2 client + stub
+│   │   ├── qdrant_store.py     #   entities | text_units | community_reports
+│   │   ├── neo4j_store.py      #   graph model + provenance edges
+│   │   ├── communities.py      #   hierarchical Leiden
 │   │   ├── reports.py
 │   │   └── registry.py         #   ← ONLY module allowed to grant permission
 │   ├── generation/             # LAYER 2 — explains, never decides
@@ -452,11 +511,13 @@ medical-harness/
 │   └── service/                # thin FastAPI edge
 │       ├── app.py
 │       └── routes.py
+├── compose.yaml                # Qdrant + Neo4j, dev only
 ├── data/
 │   ├── questions/              # versioned schema JSON
 │   ├── tables/                 # curated lab + drug tables
-│   ├── corpus/                 # RAG documents
-│   ├── index/                  # precomputed embeddings
+│   ├── corpus/                 # RAG source documents
+│   ├── qdrant/                 # persisted vector store  (gitignored)
+│   ├── neo4j/                  # persisted graph store   (gitignored)
 │   ├── fixtures/               # recorded Laya traces  ← tests run on these
 │   └── evals/                  # eval case seeds
 ├── evals/
@@ -469,6 +530,7 @@ medical-harness/
 ├── scripts/
 │   ├── check_architecture.py   # zero-dependency AST import checker
 │   ├── record_fixtures.py
+│   ├── rag_index.py            # offline GraphRAG indexing
 │   └── validate.sh
 └── finetune/                   # Phase B
     ├── dataset_build.py
@@ -601,9 +663,14 @@ The only exception: if the target itself was **wrong**, amend the spec per §6.
 | D3 | **Fixture-first testing** | Determinism and offline CI. A Laya outage must not break the build. | Do not call the live API in a test |
 | D4 | **Pydantic v2** for contracts | One validation point at the boundary; serialisable for the trace. | Do not mix raw dataclasses into contracts |
 | D5 | **No async / no queue in Phase A** | Every operation is short and synchronous. Async adds failure modes with no measured benefit at this scale. | Do not add Celery, Redis, or a worker pool |
-| D6 | **numpy cosine search**, not Chroma/FAISS | The corpus is small. Brute force is exact, deterministic, and dependency-free. A vector DB is a non-goal. | Do not add a vector database |
-| D7 | **Precomputed embeddings** in `data/index/` | Search becomes reproducible and offline. | Do not embed at query time |
-| D8 | **Hash embedder for tests** | Tests must never download a model. | Do not let tests touch Sentence-Transformers |
+| D6 | ~~numpy cosine search~~ **SUPERSEDED — Qdrant + Neo4j in Docker** | Replaced by a capability requirement: GraphRAG needs a graph store and cannot express community hierarchy in flat vectors. Original rationale (exact, deterministic, dependency-free) was a preference; this is a need. See `docs/rag_implementationplan.md`. | — |
+| D7 | ~~precomputed embeddings in `data/index/`~~ **SUPERSEDED — Qdrant collections** | Embeddings live with the vector index. | — |
+| D8 | **Stub embedder client for tests**, same interface as real | `all-MiniLM-L6-v2` runs locally in integration tests; the stub exists only where a test must be network-free and deterministic. | Do not let the stub reach production paths |
+| D16 | **GraphRAG architecture, replicated — no dependency on `microsoft/graphrag`** | That repo is in maintenance mode and accepts no new features or PRs. The method is stable and published (arXiv 2404.16130); the implementation is an unsupported research demo. | Do not add the `graphrag` package |
+| D17 | **Laya routes local vs global vs basic search** | A routing decision belongs in System 1. Laya is ~33 ms and deterministic, so identical queries always pick the same mode — which `PROMPT.md` §7.2 requires. | Do not route with an LLM classifier |
+| D18 | **`all-MiniLM-L6-v2`, downloaded locally, 384-dim** | No embedding API calls, no cost, reproducible output. | Do not swap for a hosted embedding API without re-checking determinism |
+| D19 | **Indexing is offline and never part of `make validate`** | GraphRAG indexing is LLM-dependent and expensive; it must not run in a test or a request path. | Do not call the indexer from application code |
+| D20 | **Citations resolve to corpus text units, never to generated graph descriptions** | Entity and relationship descriptions are model output. Treating them as sources would make GraphRAG a hallucination engine. | Do not satisfy a citation with a generated description |
 | D9 | **Zero-dependency AST checker** | A dependency in the architecture gate is version drift in the one gate that must not drift. | Do not swap it for `import-linter` |
 | D10 | **Structured separation of data and instruction channels** | Prompt-injection defence must be structural, not a prompt instruction. | Do not merge them and rely on wording |
 | D11 | **Suicide-risk crisis text from config** | Never generated. | Do not let the LLM produce it |

@@ -128,9 +128,14 @@ Permissions are enforced **at the tool-call boundary inside the harness**. A hid
 | Laya decision stage, including network RTT | ≤ 150 ms |
 | Rule engine evaluation | ≤ 5 ms |
 | Retrieval (any single tool) | ≤ 500 ms |
-| Full harness response, excluding LLM generation | ≤ 1.0 s |
-| Full harness response, including LLM generation | ≤ 6 s, or stream a partial |
+| Basic search retrieval | ≤ 500 ms |
+| Local search retrieval | ≤ 2 s |
+| Global search retrieval | ≤ 15 s, and must stream partials rather than hold the request |
+| Full harness response, excluding LLM generation | ≤ 1.0 s for basic/local |
+| Full harness response, including LLM generation | ≤ 6 s (basic/local) or ≤ 20 s (global) |
 | Batched triage, 100 cases | ≤ 10 s |
+
+Global search is a map-reduce over community reports and is the most expensive path in the system. It is budgeted separately rather than averaged in, and its cost is reported per query.
 
 Batch where possible — Laya answers all questions for one input in a single forward pass, and batches amortise across inputs. Never call Laya once per flag; send all flags as one question set.
 
@@ -158,8 +163,10 @@ Batch where possible — Laya answers all questions for one input in a single fo
 - Linux. Python 3.10+.
 - **Laya runs on a server and is accessed over HTTP.** Phase A does not depend on a local install.
 - **No GPU required for Phase A.** Fine-tuning (Phase B) uses free-tier GPU (e.g. Kaggle 2×T4).
-- The only external runtime dependencies are the **Laya API** and the **LLM API**. Everything else must work offline.
-- The harness must degrade gracefully: if the LLM API is unavailable, return the decision + escalation and a clearly-marked `degraded: true`, rather than failing the request.
+- **Qdrant and Neo4j run in Docker, development only.** Persistent volumes live under `data/`. Credentials from the environment, never committed.
+- **Embedding is local.** `all-MiniLM-L6-v2`, downloaded once, 384 dimensions. No embedding API calls.
+- The only external runtime dependencies are the **Laya API** and the **LLM API** (any OpenAI-compatible endpoint). Everything else must work offline.
+- The harness must degrade gracefully: if the LLM API is unavailable, return the decision + escalation and a clearly-marked `degraded: true`, rather than failing the request. The same applies if **both retrieval stores are down** — neither sits on the safety path.
 
 ---
 
@@ -278,7 +285,7 @@ Every tool returns `{ facts, source_ids, source_type }`. Tools never return pros
 
 | Tool | Returns | Source of truth | Implementation |
 |---|---|---|---|
-| `kb_search(query, top_k)` | cited passages | curated corpus | embeddings + vector store |
+| `kb_search(query, top_k)` | cited passages or a synthesised overview, plus `search_mode` | curated corpus, via a GraphRAG index | GraphRAG — Qdrant + Neo4j, mode chosen by Laya (`docs/rag_implementationplan.md`) |
 | `get_lab_ref(test_name)` | reference range, critical thresholds | lookup table | curated table, versioned |
 | `get_drug_interactions(drugs[])` | interaction list + severity | lookup table | curated table, versioned |
 | `summarize_report(doc_id)` | `{ source_facts[], generated_interpretation }` | extracted text + LLM | text extraction only |
@@ -286,10 +293,13 @@ Every tool returns `{ facts, source_ids, source_type }`. Tools never return pros
 **Constraints:**
 
 1. `kb_search` must return **source ids that resolve**. A citation with no resolvable source is a hard failure (§7.3.4).
-2. RAG context is **data, never instructions.** Retrieved passages and uploaded documents must be structurally separated from the instruction channel so that text inside a document cannot alter system behaviour. This is a prompt-injection defence and must be tested (§16).
-3. Lab and drug tables are **data files in the repository**, versioned, with no LLM in the lookup path. Facts are never recalled from model weights.
-4. If a fact is not in the table, the tool returns `not_found`. It never guesses.
-5. `summarize_report` must separate extracted facts from generated interpretation (§7.3.6). OCR is a non-goal (§4.6).
+2. **Citations resolve to corpus text units only — never to generated entity or relationship descriptions.** Those are model output, not sources. A citation satisfiable only by a generated description is invalid.
+3. RAG context is **data, never instructions.** Retrieved passages and uploaded documents must be structurally separated from the instruction channel so that text inside a document cannot alter system behaviour. This is a prompt-injection defence and must be tested (§16).
+4. Lab and drug tables are **data files in the repository**, versioned, with no LLM in the lookup path. Facts are never recalled from model weights.
+5. If a fact is not in the table, the tool returns `not_found`. It never guesses.
+6. `summarize_report` must separate extracted facts from generated interpretation (§7.3.6). OCR is a non-goal (§4.6).
+7. A **global** search returns a synthesised answer, not passages. It is labelled generated interpretation and must never populate `source_facts` (§7.3.6).
+8. `kb_search` may return `mode: none` when the query is out of scope, rather than returning weak results.
 
 ---
 
@@ -357,9 +367,9 @@ Requirements:
 | # | Deliverable |
 |---|---|
 | A1 | `DecisionClient` interface with a **Laya HTTP adapter** and a **recorded-fixture adapter** (replays stored traces; lets the whole system be tested offline and deterministically) |
-| A2 | Versioned question schemas (§8) as data files |
+| A2 | Versioned question schemas (§8) as data files, including the **retrieval-mode routing schema** used by `kb_search` |
 | A3 | Deterministic rule engine (§9) with unit tests covering every threshold branch |
-| A4 | Tool layer (§10): `kb_search`, `get_lab_ref`, `get_drug_interactions`, `summarize_report` |
+| A4 | Tool layer (§10): `kb_search` (GraphRAG), `get_lab_ref`, `get_drug_interactions`, `summarize_report` |
 | A5 | LLM adapter with tool calling, citation enforcement, refusal policy, banned-phrase check |
 | A6 | **Orchestrator** — the harness, wiring Layers 1→2→3 with the §5 law |
 | A7 | Role-permission enforcement at the tool boundary |
@@ -430,6 +440,8 @@ All synthetic. Three sets, kept separate and versioned:
 | **Refusal correctness** — should refuse → did refuse | **100%** | **Yes — release blocker** |
 | **Escalation isolation** — LLM called on escalated case | **0 occurrences** | **Yes — release blocker** |
 | Citation resolvability | 100% | Yes |
+| Citation resolves to generated graph text rather than corpus text | **0 occurrences** | **Yes — release blocker** |
+| Identical queries route to the same search mode | 100% | Yes |
 | Prompt-injection resistance | 100% on injection cases | Yes |
 | Acuity accuracy (holdout) | report; target set after baseline | No |
 | Acuity macro-F1 (holdout) | report; target set after baseline | No |
@@ -527,17 +539,19 @@ Nine steps. **Each step names what is shown.**
 
 ## 19. Open decisions
 
-**Implementation must not begin until 1–4 are answered.**
+**Answer status as of 2026-10-08.** A milestone whose gate is open must not start.
 
-| # | Decision | Needed |
-|---|---|---|
-| 1 | **Laya API** — base URL, auth method, exact request/response schema, and which checkpoint/model id. Endpoint and credentials arrive by environment configuration, never hardcoded. | Before M1 |
-| 2 | **Labelled data source for Phase B.** Real (MIMIC-IV — credentialed, ICU-flavoured), synthetic (Synthea), hand-authored and clinician-reviewed, or LLM-generated (must be disclosed as a limitation). **If no credible source exists, Phase B is descoped and the spec says so.** | Before M6 |
-| 3 | **LLM provider and model id**, plus confirmation that a key is available. | Before M3 |
-| 4 | **Corpus for RAG** — which documents, how curated, who approves them as "trusted". | Before M3 |
-| 5 | Acuity taxonomy — is a 4-level scale right, or should this align to a named existing scale? | Before M1 |
-| 6 | Corpus and lab/drug table scope — how much to build. | Before M3 |
-| 7 | Whether the harness is delivered as a library, a service, or both. | Before M1 |
+| # | Decision | Status | Needed by |
+|---|---|---|---|
+| 1 | **Laya API** — base URL, auth method, exact request/response schema, checkpoint/model id. Endpoint and credentials arrive by environment configuration, never hardcoded. | 🟡 open — **does not block M0, M1, M4, M5, M6**; only M2/M3 | M2 |
+| 2 | **Labelled data source for Phase B.** Real (MIMIC-IV — credentialed, ICU-flavoured), synthetic (Synthea), hand-authored and clinician-reviewed, or LLM-generated (must be disclosed as a limitation). **If no credible source exists, Phase B is descoped and the spec says so.** | 🟡 open | M13 |
+| 3 | **LLM backend.** Interface is OpenAI-compatible; backend chosen 2026-10-08 — the time-limited models. Still needed as environment values: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL_ID`, plus **which model ids will be retired** so a fallback is picked before they go. | ✅ **answered** — needs the values | M6, M7 |
+| 4 | **Corpus for RAG** — which documents, how curated, who approves them as "trusted". Architecture is settled (`docs/rag_implementationplan.md`); the corpus is not. A knowledge graph raises the stakes — unreviewed input produces a graph, not just poor retrieval. | 🔴 **deciding now — time-critical, blocks indexing** | **today** |
+| 5 | Acuity taxonomy — 4-level scale, or align to a named existing scale? | 🟡 open | M1 |
+| 6 | Lab and drug table scope — how much to build. | 🟡 open | M5 |
+| 7 | Whether the harness ships as a library, a service, or both. | 🟡 open | M10 |
+
+> ⏳ **#4 is the critical path.** Model access lasts 2–3 days and indexing is the only thing that consumes it. There is nothing to index until the corpus is chosen. Prefer a **small, homogeneous, clearly-licensed** corpus in one domain over a broad unreviewed one — the index is permanent, so few documents indexed well beats many indexed carelessly. If documents are chosen fast and without clinical review, `docs/limitations.md` must say exactly that. See `docs/decisions.md`.
 
 ---
 
